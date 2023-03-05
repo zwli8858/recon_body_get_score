@@ -1,105 +1,103 @@
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog
-from PyQt5.QtGui import QPixmap
-from PyQt5.uic import loadUi
 import cv2
 import numpy as np
 import time
+import os
+import argparse
+
+# 导入OpenPose库
 from openpose import pyopenpose as op
 
+# 定义动作分类模型和标签
+from sklearn.svm import SVC
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super(MainWindow, self).__init__()
-        loadUi('mainwindow.ui', self)
-        self.startButton.clicked.connect(self.start_recognition)
-        self.openButton.clicked.connect(self.open_file_dialog)
-        self.video_player = VideoPlayer(self.videoLabel)
+model = SVC(kernel='rbf', gamma='auto', C=1)
+labels = {0: 'walking', 1: 'running', 2: 'jumping'}
 
-        self.params = dict()
-        self.params["model_folder"] = "./openpose/models/"
-        self.params["model_pose"] = "BODY_25"
+# 定义OpenPose参数
+params = dict()
+params["model_folder"] = "models/"
+params["model_pose"] = "COCO"
+params["net_resolution"] = "-1x368"
+params["output_resolution"] = "-1x-1"
+params["num_gpu_start"] = 0
+params["disable_blending"] = False
+params["default_model_folder"] = "models/"
+params["render_threshold"] = 0.05
+params["alpha_pose"] = 0.6
+params["scale_gap"] = 0.3
+params["scale_number"] = 1
+params["disable_multi_thread"] = False
+params["fps_max"] = 30.0
 
-    def open_file_dialog(self):
-        # 打开文件对话框，选择要播放的视频
-        file_dialog = QFileDialog()
-        file_path = file_dialog.getOpenFileName(self, '选择文件', './')
-        if file_path[0]:
-            self.video_player.load_video(file_path[0])
-            self.startButton.setEnabled(True)
+# 初始化OpenPose
+opWrapper = op.WrapperPython()
+opWrapper.configure(params)
+opWrapper.start()
 
-    def start_recognition(self):
-        # 禁用开始按钮，避免多次点击
-        self.startButton.setEnabled(False)
+# 读取视频文件
+cap = cv2.VideoCapture('video.mp4')
+fps = cap.get(cv2.CAP_PROP_FPS)
+frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # 开始进行动作识别
-        score = 0
-        start_time = time.time()
-        frame_count = 0
-        while True:
-            # 读取视频帧
-            ret, frame = self.video_player.get_frame()
-            if not ret:
-                break
+# 定义变量记录动作信息
+action_start_time = None
+last_label = None
+speeds = []
 
-            # 进行动作识别
-            pose_keypoints, frame = self.recognition(frame)
+# 处理每一帧
+while True:
+    # 读取一帧
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-            # 计算动作分数
-            if pose_keypoints is not None:
-                score += compute_score(pose_keypoints)
-                frame_count += 1
+    # 转换颜色空间
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # 将帧显示在界面上
-            self.video_player.display_frame(frame)
+    # 运行OpenPose
+    datum = op.Datum()
+    datum.cvInputData = img
+    opWrapper.emplaceAndPop([datum])
+    keypoints = datum.poseKeypoints
 
-        # 计算平均分数
-        if frame_count > 0:
-            score /= frame_count
+    # 如果检测到人体关键点，进行动作分类和时间计算
+    if keypoints is not None:
+        # 提取关键点坐标
+        x = keypoints[0][:, 0]
+        y = keypoints[0][:, 1]
 
-        # 显示动作分数
-        self.scoreLabel.setText('%.2f' % score)
+        # 对关键点序列进行归一化处理
+        x = (x - np.min(x)) / (np.max(x) - np.min(x))
+        y = (y - np.min(y)) / (np.max(y) - np.min(y))
 
-        # 重新启用开始按钮
-        self.startButton.setEnabled(True)
+        # 进行动作分类
+        feature = np.hstack((x, y))
+        label = model.predict([feature])[0]
 
-        # 打印动作识别耗时
-        print('Recognition time:', time.time() - start_time)
+        # 如果检测到新的动作，记录开始时间戳
+        if label != last_label:
+            action_start_time = time.time()
+            last_label = label
 
-    def recognition(self, frame):
-        # 初始化OpenPose
-        opWrapper = op.WrapperPython()
-        opWrapper.configure(self.params)
-        opWrapper.start()
+            # 如果当前动作已经持续一定时间，计算速度并记录
+            if action_start_time is not None and time.time() - action_start_time > 2.0:
+                action_duration = time.time() - action_start_time
+                speed = np.sum(np.abs(np.diff(x))) / action_duration
+                speeds.append(speed)
 
-        # 运行OpenPose
-        datum = op.Datum()
-        datum.cvInputData = frame
-        opWrapper.emplaceAndPop([datum])
+                print('Action:', labels[label])
+                print('Duration:', action_duration)
+                print('Speed:', speed)
+                print('---')
+                action_start_time = None
 
-        # 获取姿态关键点
-        pose_keypoints = None
-        if len(datum.poseKeypoints) > 0:
-            pose_keypoints = datum.poseKeypoints[0]
+    # 计算平均速度和评估动作质量
+    avg_speed = np.mean(speeds)
+    quality_score = np.interp(avg_speed, [0, 10], [0, 100])
+    print('Average speed:', avg_speed)
+    print('Quality score:', quality_score)
 
-        # 可视化结果
-        if len(datum.poseKeypoints) > 0:
-            frame = datum.cvOutputData
+    # 释放资源
+    cap.release()
+    cv2.destroyAllWindows()
 
-        return pose_keypoints, frame
-
-
-class VideoPlayer:
-    def __init__(self, label):
-        self.label = label
-        self.cap = None
-
-    def load_video(self, file_path):
-        self.cap = cv2.VideoCapture(file_path)
-
-    def get_frame(self):
-        if self.cap is None:
-            return None, None
-        ret, frame = self.cap.read()
-        if not ret:
-            return None, None
-        return
