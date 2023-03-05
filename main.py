@@ -1,105 +1,105 @@
-from typing import Dict, Tuple, Any, List
-import numpy as np
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog
+from PyQt5.QtGui import QPixmap
+from PyQt5.uic import loadUi
 import cv2
-import os
-import sys
+import numpy as np
 import time
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
-from PyQt5.QtGui import *
-from functools import partial
-from threading import Thread
-
-# 导入 OpenPose 库
-try:
-    # 尝试从系统路径导入
-    sys.path.append('/usr/local/python')
-    from openpose import pyopenpose as op
-except ImportError as e:
-    print('无法导入 OpenPose 库，请设置系统路径。')
-    raise e
+from openpose import pyopenpose as op
 
 
-class ActionRecognitionGUI(QWidget):
+class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__()
+        super(MainWindow, self).__init__()
+        loadUi('mainwindow.ui', self)
+        self.startButton.clicked.connect(self.start_recognition)
+        self.openButton.clicked.connect(self.open_file_dialog)
+        self.video_player = VideoPlayer(self.videoLabel)
 
-        # 设置窗口标题和大小
-        self.setWindowTitle('动作识别')
-        self.resize(800, 600)
+        self.params = dict()
+        self.params["model_folder"] = "./openpose/models/"
+        self.params["model_pose"] = "BODY_25"
 
-        # 创建控件
-        self.video_label = QLabel(self)
-        self.start_button = QPushButton('开始', self)
-        self.progress_bar = QProgressBar(self)
-        self.status_label = QLabel('等待中', self)
-
-        # 创建布局
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(self.video_label)
-        main_layout.addWidget(self.start_button)
-        main_layout.addWidget(self.progress_bar)
-        main_layout.addWidget(self.status_label)
-        self.setLayout(main_layout)
-
-        # 连接信号和槽
-        self.start_button.clicked.connect(self.start_recognition)
-
-        # 初始化 OpenPose
-        self.op_wrapper = op.WrapperPython()
-        params = dict(model_folder='openpose/models')
-        self.op_wrapper.configure(params)
-        self.op_wrapper.start()
-
-        # 初始化识别器
-        self.recognizer = ActionRecognizer()
+    def open_file_dialog(self):
+        # 打开文件对话框，选择要播放的视频
+        file_dialog = QFileDialog()
+        file_path = file_dialog.getOpenFileName(self, '选择文件', './')
+        if file_path[0]:
+            self.video_player.load_video(file_path[0])
+            self.startButton.setEnabled(True)
 
     def start_recognition(self):
-        # 获取视频路径
-        file_path, _ = QFileDialog.getOpenFileName(self, '选择视频文件', '.', '视频文件 (*.mp4 *.avi *.mov)')
-        if not file_path:
-            return
+        # 禁用开始按钮，避免多次点击
+        self.startButton.setEnabled(False)
 
-        # 启动识别线程
-        self.recognition_thread = ActionRecognitionThread(self.recognizer, file_path)
-        self.recognition_thread.result_signal.connect(self.update_progress)
-        self.recognition_thread.start()
+        # 开始进行动作识别
+        score = 0
+        start_time = time.time()
+        frame_count = 0
+        while True:
+            # 读取视频帧
+            ret, frame = self.video_player.get_frame()
+            if not ret:
+                break
 
-        # 显示视频
-        self.video_cap = cv2.VideoCapture(file_path)
-        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.fps = int(self.video_cap.get(cv2.CAP_PROP_FPS))
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.show_frame)
-        self.timer.start(1000 // self.fps)
+            # 进行动作识别
+            pose_keypoints, frame = self.recognition(frame)
 
-        # 更新界面状态
-        self.status_label.setText('正在识别视频...')
-        self.start_button.setEnabled(False)
-        self.progress_bar.setValue(0)
+            # 计算动作分数
+            if pose_keypoints is not None:
+                score += compute_score(pose_keypoints)
+                frame_count += 1
 
-    def show_frame(self):
-        ret, frame = self.video_cap.read()
-        if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, c = frame.shape
-            qimage = QImage(frame, w, h, w * c, QImage.Format_RGB888)
-            self.video_label.setPixmap(QPixmap.fromImage(qimage))
-        else:
-            self.timer.stop()
-            self.video_cap.release()
-            self.video_label.clear()
-            self.status_label.setText('等待中')
-            self.start_button.setEnabled(True)
+            # 将帧显示在界面上
+            self.video_player.display_frame(frame)
 
-    def update_progress(self, progress):
-        self.progress_bar.setValue(progress)
-        if progress == 100:
-            self.status_label.setText('识别完成')
-            self.start_button.setEnabled(True)
+        # 计算平均分数
+        if frame_count > 0:
+            score /= frame_count
+
+        # 显示动作分数
+        self.scoreLabel.setText('%.2f' % score)
+
+        # 重新启用开始按钮
+        self.startButton.setEnabled(True)
+
+        # 打印动作识别耗时
+        print('Recognition time:', time.time() - start_time)
+
+    def recognition(self, frame):
+        # 初始化OpenPose
+        opWrapper = op.WrapperPython()
+        opWrapper.configure(self.params)
+        opWrapper.start()
+
+        # 运行OpenPose
+        datum = op.Datum()
+        datum.cvInputData = frame
+        opWrapper.emplaceAndPop([datum])
+
+        # 获取姿态关键点
+        pose_keypoints = None
+        if len(datum.poseKeypoints) > 0:
+            pose_keypoints = datum.poseKeypoints[0]
+
+        # 可视化结果
+        if len(datum.poseKeypoints) > 0:
+            frame = datum.cvOutputData
+
+        return pose_keypoints, frame
 
 
-class ActionRecognitionThread(QThread):
-    result_signal = pyqtSignal(int)
+class VideoPlayer:
+    def __init__(self, label):
+        self.label = label
+        self.cap = None
 
-    def __
+    def load_video(self, file_path):
+        self.cap = cv2.VideoCapture(file_path)
+
+    def get_frame(self):
+        if self.cap is None:
+            return None, None
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, None
+        return
